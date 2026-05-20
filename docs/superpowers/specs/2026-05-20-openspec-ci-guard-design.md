@@ -79,8 +79,8 @@ openspec-ci-guard/
 │   └── index.js                    # calls CLI, posts PR comment
 ├── skills/
 │   ├── opsx.ci.check.md
-│   ├── opsx.ci.drift.md
 │   ├── opsx.ci.report.md
+│   ├── opsx.ci.badge.md
 │   └── opsx.ci.gate.md
 ├── skill.yml                       # Claude Code extension manifest
 ├── package.json
@@ -200,24 +200,33 @@ The system MUST ...
 
 ---
 
-### Check 4 — Orphaned active changes
+### Check 4 — Orphaned and stale active changes
 
-**What:** An active change where all tasks are done but `archive` was never run. Delta specs never merged into source-of-truth.
+Two sub-checks with different triggers:
+
+**4a — Orphaned (completed, not archived):** All tasks `[x]`, change still active. Delta specs never merged into source-of-truth.
+
+**4b — Stale (incomplete, idle):** Tasks still incomplete but the change folder hasn't been modified in `max_idle_days` (default: 30). Detected via `git log -- openspec/changes/<name>/`. A change nobody has touched in a month is accumulating maintenance debt.
 
 **When:** Every PR + scheduled.
 
 **How:**
 1. For each active change, parse `tasks.md` checkboxes
-2. If all tasks are `[x]` and the change has not been archived: flag as orphaned
-3. Optionally check `design.md > File Changes` — if those files exist and were recently modified, confidence increases
+2. Get last git modification date for the change folder
+3. If all tasks `[x]` and not archived → **orphaned**
+4. If any tasks `[ ]` and last modification > `max_idle_days` → **stale**
 
 **Output:**
 ```
-## Orphaned Changes (completed but not archived)
+## Change Maintenance
 
-  ⚠ add-dark-mode  — 8/8 tasks complete, not archived
+Orphaned (completed but not archived):
+  ⚠ add-dark-mode  — 8/8 tasks complete, not archived for 12 days
     → Run: openspec archive add-dark-mode
-    → Or: /opsx:archive add-dark-mode
+
+Stale (incomplete, idle):
+  ⚠ fix-payments   — 2/5 tasks done, no activity for 34 days
+    → Resume, reassign, or close this change
 ```
 
 ---
@@ -287,35 +296,53 @@ Setting `type: hotfix` in a change's `.openspec.yaml` overrides inferred size en
 ## CLI Interface
 
 ```
-openspec-ci-guard check              # checks 3, 4, 5, 6 — per-PR suite
-openspec-ci-guard drift              # all drift types
-openspec-ci-guard drift --type branch   # check 1
-openspec-ci-guard drift --type sot      # check 2
-openspec-ci-guard drift --type reverse  # check 3
+openspec-ci-guard check              # full per-PR suite: branch drift, reverse drift,
+                                     # artifact completeness, orphaned changes,
+                                     # inter-change conflicts
+openspec-ci-guard check --full       # adds source-of-truth drift (slower; use on schedule)
 openspec-ci-guard report             # full traceability across all checks
+openspec-ci-guard badge              # generate spec compliance badge for README
 openspec-ci-guard gate               # write/update .openspec-ci.yml
 ```
 
+`check` is the primary command. It runs all checks appropriate for a PR context.  
+`check --full` adds SoT drift for scheduled/main-push runs. No separate `drift` subcommand — callers do not need to know which internal checks map to which contexts.
+
 **Global flags:**
 - `--format markdown|json` (default: markdown)
-- `--suggest-stubs` (with drift --type reverse: generate delta spec scaffolds)
+- `--suggest-stubs` (generate delta spec scaffolds for uncovered code changes)
 - `--root <path>` (default: cwd, for monorepo support)
 - `--base <branch>` (default: origin/main, for merge-base calculation)
 
 **Exit codes:**
-- `0` — always, unless gates configured in `.openspec-ci.yml`
+- `0` — always; reports are generated regardless of gate configuration. Gates only change exit code, never suppress output.
+- `1` — only when a gate is configured with `fail: true` and its threshold is exceeded
 
 ---
 
 ## Configuration (.openspec-ci.yml)
 
+Should be committed to the repository so gate configuration is versioned and team-owned.
+
 ```yaml
 version: "1"
 mode: report            # report | gate
+                        # report: always exits 0, reports all findings
+                        # gate: exits 1 when a check with fail:true exceeds its threshold
+                        # either mode always generates full reports — mode only affects exit code
 
 change_size:
   simple_max_lines: 50  # changes under this are "simple" (reduced artifact reqs)
   simple_max_files: 5
+
+# Override required artifacts per change type.
+# Defaults shown. Teams can loosen or tighten per type.
+artifact_requirements:
+  hotfix:   [tasks]
+  bugfix:   [proposal, tasks]
+  simple:   [tasks]
+  enhancement: [proposal, specs, tasks]
+  feature:  [proposal, specs, design, tasks]
 
 gates:
   artifact_completeness:
@@ -345,22 +372,33 @@ gates:
   orphaned_changes:
     fail: false
     warn: true
-    max_age_days: 7       # warn if completed change older than 7 days un-archived
+    max_completed_days: 7   # warn if ALL tasks done but not archived for > 7 days
+
+  stale_changes:
+    fail: false
+    warn: true
+    max_idle_days: 30       # warn if ANY tasks incomplete and change untouched for > 30 days
+                            # uses git log to detect last modification to the change folder
 
   inter_change_conflicts:
-    fail: false           # requirement-level conflicts → fail
-    warn: true            # domain-level overlaps → warn
+    fail: false             # requirement-level conflicts → fail
+    warn: true              # domain-level overlaps → warn
 ```
 
 ---
 
 ## GitHub Action
 
-Two jobs:
+Single job. The action detects its own execution context (PR vs schedule vs push to main) and runs the appropriate check set automatically. Consumers do not configure which checks to run — the tool decides based on context.
 
-**`on: pull_request`** — runs `check` + `drift --type branch` + `drift --type reverse`, posts PR comment with full report.
+| Context | Checks run | Output |
+|---------|-----------|--------|
+| `pull_request` | `check` (branch drift, reverse drift, artifact completeness, orphaned, conflicts) | PR comment |
+| `push` to default branch | `check --full` (adds SoT drift) | Job summary |
+| `schedule` | `check --full` | Job summary |
+| Manual dispatch | `check --full` | Job summary |
 
-**`on: schedule` or `on: push to main`** — runs `drift --type sot` + orphaned check, posts to GitHub Actions job summary.
+**Note on SoT drift and the "always visible" principle:** SoT drift does not run per-PR because it scans the full codebase and is too noisy for brownfield projects on every commit. Instead it runs on push to main and on schedule — ensuring it is always visible on a regular cadence, not silently skipped. This is consistent with Principle 2 ("drift is always visible") because teams see it at a defined, governed frequency rather than never.
 
 ```yaml
 # .github/workflows/openspec-ci.yml (example for consumers)
@@ -368,6 +406,8 @@ name: OpenSpec CI Guard
 
 on:
   pull_request:
+  push:
+    branches: [main]
   schedule:
     - cron: '0 9 * * 1'  # weekly Monday 9am
 
@@ -381,7 +421,6 @@ jobs:
       - uses: mhenke/openspec-ci-guard@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          format: markdown
           suggest-stubs: true
 ```
 
@@ -389,11 +428,33 @@ jobs:
 
 | Input | Default | Description |
 |-------|---------|-------------|
-| `token` | required | GitHub token for PR comments |
+| `token` | required | GitHub token for PR comments and job summaries |
 | `format` | `markdown` | Report format |
 | `suggest-stubs` | `false` | Generate delta spec stubs for reverse drift |
 | `base-branch` | `main` | Branch to diff against |
 | `config-file` | `.openspec-ci.yml` | Config file path |
+
+---
+
+## Badge
+
+`openspec-ci-guard badge` generates a spec health badge for README display, driven by the last `check` run's results.
+
+```
+openspec-ci-guard badge              # print badge markdown for README
+openspec-ci-guard badge --format url # print shield.io URL only
+```
+
+**Output (markdown):**
+```markdown
+![Spec Health](https://img.shields.io/badge/spec_health-92%25-brightgreen?style=flat-square)
+![Tasks](https://img.shields.io/badge/tasks-14%2F14-brightgreen?style=flat-square)
+![Drift](https://img.shields.io/badge/drift-8%25-green?style=flat-square)
+```
+
+Badges are generated from local check results — no external service required. Color thresholds match the configured gate thresholds in `.openspec-ci.yml`.
+
+Claude Code skill: `/opsx.ci.badge` — generates badge markdown and instructions for adding to README.
 
 ---
 
@@ -403,12 +464,12 @@ Four skills installed to `.claude/skills/` (via `skill.yml`):
 
 | Skill | Purpose |
 |-------|---------|
-| `/opsx.ci.check` | Run all per-PR checks — artifact completeness, orphaned changes, inter-change conflicts, reverse drift |
-| `/opsx.ci.drift` | Drift analysis — branch, SoT, or reverse. Accepts `--type` argument |
-| `/opsx.ci.report` | Full traceability report across all checks |
-| `/opsx.ci.gate` | View or configure `.openspec-ci.yml` gate rules |
+| `/opsx.ci.check` | Run all checks appropriate for the current context. Interprets results, suggests next actions (archive, retrofit spec, resolve conflict), and explains what each finding means — not a pass-through to the CLI |
+| `/opsx.ci.report` | Full traceability report with AI-assisted interpretation: which findings are highest priority, what the drift pattern indicates, suggested remediation order |
+| `/opsx.ci.badge` | Generate spec health badge markdown for README |
+| `/opsx.ci.gate` | View or configure `.openspec-ci.yml` — explains trade-offs of each gate threshold |
 
-Skills call the CLI when available (`npx openspec-ci-guard`). If the CLI isn't installed, they describe the checks for the AI to run manually by reading OpenSpec files directly.
+Skills call the CLI when available (`npx openspec-ci-guard`). When the CLI is not installed, skills perform equivalent checks by reading OpenSpec files directly. Either way, skills add genuine AI-native value — interpretation, prioritization, and actionable next steps — not just formatted CLI output.
 
 ---
 
